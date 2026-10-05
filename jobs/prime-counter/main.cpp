@@ -4,26 +4,6 @@
 // What it does: counts how many prime numbers exist from 2 up to TARGET.
 // It's slow on purpose, autosaves its progress, and resumes from a save file.
 // It follows docs/checkpoint-contract.md exactly. Read that first.
-//
-// Rule: no third-party libraries. Only the C++ standard library + <csignal>.
-// Style: prototypes at the top, definitions below main(), like your class code.
-//
-// -----------------------------------------------------------------------------
-// STEP 1: Includes
-// -----------------------------------------------------------------------------
-//   <iostream>, <fstream>, <string>, <cstdlib> (getenv, exit codes),
-//   <csignal> (signals), <atomic>, <chrono>, <filesystem>, <cstdint>.
-//   Then: using namespace std;
-//
-// -----------------------------------------------------------------------------
-// STEP 2: A struct for the job's progress
-// -----------------------------------------------------------------------------
-//   Make a struct named Progress with three fields, all 64-bit integers
-//   (int64_t, because these numbers get bigger than an int can hold):
-//     - next_number   : the next number to test (starts at 2)
-//     - primes_found  : how many primes found so far (starts at 0)
-//     - last_prime    : the biggest prime found so far (starts at 0)
-//
 // -----------------------------------------------------------------------------
 // STEP 3: A global "should I stop?" flag
 // -----------------------------------------------------------------------------
@@ -135,3 +115,21 @@
 //   Test D:  final count must be the same whether or not you interrupted it.
 //            (Primes up to 1,000,000 = 78,498. Use that to check correctness.)
 // =============================================================================
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+
+using namespace std;
+
+struct Progress {
+    int64_t next_number = 2;
+    int64_t primes_found = 0;
+    int64_t last_prime = 0;
+};
