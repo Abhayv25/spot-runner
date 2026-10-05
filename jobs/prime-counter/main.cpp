@@ -135,3 +135,29 @@ bool is_prime(int64_t n);
 bool load_checkpoint(const string& path, Progress& progress);
 bool save_checkpoint_atomically(const string& path, const Progress& progress);
 bool write_result(const string& path, const Progress& progress);
+
+string get_env_or(const string& name, const string& fallback) {
+    const char* value = getenv(name.c_str());
+    if (value == nullptr) {
+        return fallback;
+    }
+
+    return value;
+};
+
+bool is_prime(int64_t n) {
+    if (n < 2) {
+        return false;
+    } else if (n == 2) {
+        return true;
+    } else if (n % 2 == 0) {
+        return false;
+    }
+
+    for (int64_t i = 3; i * i <= n; i += 2) {
+        if (i % n == 0) {
+            return false;
+        }
+        return true;
+    }
+}
