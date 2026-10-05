@@ -5,13 +5,6 @@
 // It's slow on purpose, autosaves its progress, and resumes from a save file.
 // It follows docs/checkpoint-contract.md exactly. Read that first.
 // -----------------------------------------------------------------------------
-// STEP 3: A global "should I stop?" flag
-// -----------------------------------------------------------------------------
-//   Make a global: atomic<bool> g_stop_requested{false};
-//   Why atomic: a signal can arrive at ANY moment, even in the middle of
-//   your loop. atomic makes reading/writing it safe.
-//
-// -----------------------------------------------------------------------------
 // STEP 4: Prototypes (declare these, define them below main)
 // -----------------------------------------------------------------------------
 //   void handle_signal(int signal_number);
@@ -133,3 +126,12 @@ struct Progress {
     int64_t primes_found = 0;
     int64_t last_prime = 0;
 };
+
+atomic<bool> g_stop_requested{false};
+
+void handle_signal(int signal_number);
+string get_env_or(const string& name, const string& fallback);
+bool is_prime(int64_t n);
+bool load_checkpoint(const string& path, Progress& progress);
+bool save_checkpoint_atomically(const string& path, const Progress& progress);
+bool write_result(const string& path, const Progress& progress);
