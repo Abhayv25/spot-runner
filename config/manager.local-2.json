@@ -1,0 +1,20 @@
+{
+  "mode": "local",
+  "manager_id": "laptop-2",
+
+  "work_dir": "./run/work/laptop-2",
+  "docker_socket": "/var/run/docker.sock",
+
+  "poll_interval_ms": 1000,
+  "checkpoint_upload_interval_seconds": 5,
+  "stop_grace_seconds": 30,
+  "lease_seconds": 60,
+  "max_attempts": 3,
+  "idle_wait_seconds": 5,
+
+  "local": {
+    "storage_dir": "./run/storage",
+    "queue_dir": "./run/queue",
+    "interrupt_file": "./run/interrupt-laptop-2"
+  }
+}

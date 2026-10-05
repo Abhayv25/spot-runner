@@ -1,0 +1,48 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug (local development)",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SPOT_RUNNER_BUILD_TESTS": "ON",
+        "SPOT_RUNNER_ENABLE_AWS": "OFF"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (fast, for benchmarks and EC2)",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SPOT_RUNNER_BUILD_TESTS": "OFF",
+        "SPOT_RUNNER_ENABLE_AWS": "OFF"
+      }
+    },
+    {
+      "name": "debug-aws",
+      "displayName": "Debug + AWS (Phase 7, needs the AWS SDK installed)",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/build/debug-aws",
+      "cacheVariables": {
+        "SPOT_RUNNER_ENABLE_AWS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug-aws", "configurePreset": "debug-aws" }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
