@@ -1,35 +1,58 @@
-// =============================================================================
-// container_runtime.h: the INTERFACE for "something that runs containers" (PHASE 5)
-// =============================================================================
-// An interface is a class with only pure virtual functions. It describes WHAT can
-// be done, not HOW. DockerClient is the real "how". In tests, a FakeRuntime is a
-// pretend "how", so you can test JobRunner without Docker running.
-// This exact pattern (interface + real + fake) repeats for storage, queue and watcher.
-// Interviewers call it "dependency injection". Be ready to explain why you used it.
-//
-// STEP 1: #pragma once, includes <string>, <map>, <optional>, namespace spot_runner
-//
-// STEP 2: struct ContainerSpec (everything needed to start one container)
-//   std::string image;                           // "prime-counter:latest"
-//   std::string name;                            // e.g. "spot-job-001", must be unique
-//   std::map<std::string, std::string> env;      // JOB_ID, CHECKPOINT_DIR, TARGET...
-//   std::string host_checkpoint_dir;             // ABSOLUTE path on the computer
-//   std::string container_checkpoint_dir = "/checkpoint";
-//
-// STEP 3: struct ContainerStatus
-//   bool running = false;
-//   bool exists = false;                         // false if it was removed
-//   int exit_code = 0;                           // only meaningful when !running
-//
-// STEP 4: class ContainerRuntime (the interface)
-//   public:
-//     virtual ~ContainerRuntime() = default;     // ALWAYS a virtual destructor in a base class
-//     virtual bool ping() = 0;                   // "is Docker there?"
-//     virtual void ensure_image(const std::string& image) = 0;   // pull if missing
-//     virtual std::string create_and_start(const ContainerSpec& spec) = 0; // returns id
-//     virtual ContainerStatus inspect(const std::string& container_id) = 0;
-//     virtual void stop(const std::string& container_id, int grace_seconds) = 0;
-//     virtual void remove(const std::string& container_id) = 0;
-//     virtual std::string logs_tail(const std::string& container_id, int lines) = 0;
-//   (No .cpp for this file. Interfaces don't need one.)
-// =============================================================================
+#pragma once
+
+#include <chrono>
+#include <map>
+#include <string>
+
+namespace spot_runner {
+
+struct ContainerSpec {
+    std::string image;  // Docker image reference, or an executable path for ProcessRuntime
+    std::string name;   // unique per running job, e.g. "spot-runner-job-001"
+    std::map<std::string, std::string> env;
+    std::map<std::string, std::string> labels;
+    // Absolute host directory shared with the job. The runtime exposes it to
+    // the job and sets CHECKPOINT_DIR to the path the job should use.
+    std::string checkpoint_dir;
+};
+
+struct ContainerStatus {
+    bool exists = false;
+    bool running = false;
+    int exit_code = 0;  // valid when exists && !running; 128+N if killed by signal N
+};
+
+// Something that can run a job and report how it exited. JobRunner depends
+// only on this interface, so the same scheduling logic runs against Docker in
+// production, against plain child processes in local chaos tests, and against
+// an in-memory fake in unit tests.
+class ContainerRuntime {
+public:
+    virtual ~ContainerRuntime() = default;
+
+    // Returns true if the runtime is reachable and usable.
+    virtual bool ping() = 0;
+
+    // Makes sure the image is available locally (pulls if necessary).
+    virtual void ensure_image(const std::string& image) = 0;
+
+    // Starts the job; returns an opaque handle (container ID or PID).
+    virtual std::string start(const ContainerSpec& spec) = 0;
+
+    virtual ContainerStatus inspect(const std::string& handle) = 0;
+
+    // Sends SIGTERM, waits up to `grace`, then SIGKILL. Blocks until stopped.
+    virtual void stop(const std::string& handle, std::chrono::seconds grace) = 0;
+
+    // Releases resources. Safe to call on a handle that no longer exists.
+    virtual void remove(const std::string& handle) = 0;
+
+    // Last lines of the job's stdout/stderr, for diagnostics.
+    virtual std::string logs_tail(const std::string& handle, int lines) = 0;
+
+    // Removes leftovers from a previous run of this manager (for example after
+    // a crash). Matches on the "spot-runner.manager" label.
+    virtual void remove_orphans(const std::string& manager_id) = 0;
+};
+
+}  // namespace spot_runner
