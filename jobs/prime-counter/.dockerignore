@@ -1,16 +1,3 @@
-# =============================================================================
-# .dockerignore (PHASE 2, YOUR TURN)
-# =============================================================================
-# Works like .gitignore, but for "docker build". Anything listed here is NOT sent
-# to Docker when it builds the image. This keeps builds fast and stops junk
-# (or secrets) from ending up inside your image.
-#
-# Add patterns for:
-#   - any build output folders (you don't want your Mac's compiled files inside a Linux image;
-#     they won't even run there)
-#   - checkpoint folders from local testing
-#   - editor and OS junk files
-#
-# Then check it worked: build the image and look at the "transferring context" size
-# in the output. It should be tiny (a few KB).
-# =============================================================================
+*
+!CMakeLists.txt
+!main.cpp

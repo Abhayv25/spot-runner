@@ -1,137 +1,309 @@
-// =============================================================================
-// prime-counter: the fake "long job" (PHASE 1 in README.md)
-// =============================================================================
-// What it does: counts how many prime numbers exist from 2 up to TARGET.
-// It's slow on purpose, autosaves its progress, and resumes from a save file.
-// It follows docs/checkpoint-contract.md exactly. Read that first.
+// prime-counter: reference workload for spot-runner.
 //
-// Rule: no third-party libraries. Only the C++ standard library + <csignal>.
-// Style: prototypes at the top, definitions below main(), like your class code.
+// Counts the primes in [2, TARGET] by trial division. The computation is
+// deliberately CPU-bound and slow so that it can be interrupted mid-run, and
+// it implements the checkpoint contract described in docs/checkpoint-contract.md:
 //
-// -----------------------------------------------------------------------------
-// STEP 1: Includes
-// -----------------------------------------------------------------------------
-//   <iostream>, <fstream>, <string>, <cstdlib> (getenv, exit codes),
-//   <csignal> (signals), <atomic>, <chrono>, <filesystem>, <cstdint>.
-//   Then: using namespace std;
+//   - On start, resume from $CHECKPOINT_DIR/checkpoint.dat if it exists.
+//   - Autosave progress every AUTOSAVE_MS milliseconds (atomic write).
+//   - On SIGTERM or SIGINT, write a final checkpoint and exit with code 75.
+//   - On completion, write result.dat and exit with code 0.
 //
-// -----------------------------------------------------------------------------
-// STEP 2: A struct for the job's progress
-// -----------------------------------------------------------------------------
-//   Make a struct named Progress with three fields, all 64-bit integers
-//   (int64_t, because these numbers get bigger than an int can hold):
-//     - next_number   : the next number to test (starts at 2)
-//     - primes_found  : how many primes found so far (starts at 0)
-//     - last_prime    : the biggest prime found so far (starts at 0)
-//
-// -----------------------------------------------------------------------------
-// STEP 3: A global "should I stop?" flag
-// -----------------------------------------------------------------------------
-//   Make a global: atomic<bool> g_stop_requested{false};
-//   Why atomic: a signal can arrive at ANY moment, even in the middle of
-//   your loop. atomic makes reading/writing it safe.
-//
-// -----------------------------------------------------------------------------
-// STEP 4: Prototypes (declare these, define them below main)
-// -----------------------------------------------------------------------------
-//   void handle_signal(int signal_number);
-//   string get_env_or(const string& name, const string& fallback);
-//   bool is_prime(int64_t n);
-//   bool load_checkpoint(const string& path, Progress& progress);
-//   bool save_checkpoint_atomically(const string& path, const Progress& progress);
-//   bool write_result(const string& path, const Progress& progress);
-//
-// -----------------------------------------------------------------------------
-// STEP 5: main()
-// -----------------------------------------------------------------------------
-//   5a. Install the signal handler for BOTH SIGTERM and SIGINT:
-//         signal(SIGTERM, handle_signal); signal(SIGINT, handle_signal);
-//
-//   5b. Read settings with get_env_or:
-//         JOB_ID           (fallback "local-test")
-//         CHECKPOINT_DIR   (fallback "./checkpoint" so it works outside Docker)
-//         TARGET           (fallback "100000000"), convert with stoll
-//         AUTOSAVE_SECONDS (fallback "10"), convert with stoi
-//       Build two paths: CHECKPOINT_DIR + "/checkpoint.dat" and "/result.dat".
-//       Create CHECKPOINT_DIR if it doesn't exist (filesystem::create_directories).
-//
-//   5c. Make a Progress. Call load_checkpoint. Print ONE line either way:
-//         "[job-001] resuming from 48,000,001 (2,891,000 primes so far)"
-//         "[job-001] no checkpoint, starting fresh"
-//       (cout, then flush with endl. Docker logs only show flushed output.)
-//
-//   5d. Remember the time of the last autosave (chrono::steady_clock::now()).
-//
-//   5e. The main loop: while next_number <= TARGET
-//         - If g_stop_requested is true:
-//             save_checkpoint_atomically, print "[job] stop requested, saved at N",
-//             return 75.   (75 = "stopped early, safe to resume")
-//         - If is_prime(next_number): increase primes_found, set last_prime.
-//         - Increase next_number by 1.
-//         - Every 100,000 numbers (use %), check if AUTOSAVE_SECONDS have passed
-//           since the last autosave. If yes: save, print a short progress line,
-//           reset the timer. (Checking the clock every single number is slow.)
-//
-//   5f. After the loop (finished!):
-//         write_result, then save one last checkpoint too, print a summary,
-//         return 0.
-//
-//   5g. If any save/write fails, print the error to cerr and return 1.
-//
-// -----------------------------------------------------------------------------
-// STEP 6: Define the helper functions (below main)
-// -----------------------------------------------------------------------------
-//   handle_signal:
-//     Only set g_stop_requested = true. Do NOT print or save inside a signal
-//     handler. Most functions aren't safe to call from one. The main loop
-//     notices the flag and does the real work.
-//
-//   get_env_or:
-//     Call getenv(name.c_str()). If it returns nullptr, return fallback.
-//
-//   is_prime:
-//     n < 2 -> false. 2 -> true. Even -> false.
-//     Then try odd divisors i from 3 while i * i <= n. If n % i == 0 -> false.
-//     Return true. (Simple trial division is fine. Slow is the point.)
-//
-//   load_checkpoint:
-//     If the file doesn't exist, return false.
-//     The format is up to you (the manager never reads it). Simple choice:
-//     three lines of "key=value":
-//         next_number=48000001
-//         primes_found=2891000
-//         last_prime=47999987
-//     Read each line, split on '=', fill the struct with stoll.
-//     If anything looks wrong (missing key, bad number), print a warning and
-//     return false so the job starts fresh instead of crashing.
-//
-//   save_checkpoint_atomically:  (THE most important function in this file)
-//     1. Open path + ".tmp" with ofstream (truncate mode).
-//     2. Write the three key=value lines.
-//     3. Call flush() and check the stream is still good.
-//     4. Close it.
-//     5. filesystem::rename(tmp_path, path). Rename replaces the old file in
-//        one step, so a reader sees either the old save or the new one, never
-//        half of one. Wrap in try/catch(filesystem::filesystem_error&).
-//     Return true on success.
-//     (Bonus later: real fsync needs <fcntl.h>/<unistd.h> and a file
-//      descriptor. Mention it in your README as a known trade-off.)
-//
-//   write_result:
-//     Same atomic tmp-then-rename steps, writing a short summary:
-//         target=...  primes_found=...  last_prime=...
-//
-// -----------------------------------------------------------------------------
-// STEP 7: Test it WITHOUT Docker (do all of these before Phase 2)
-// -----------------------------------------------------------------------------
-//   Build:   cmake --preset debug && cmake --build --preset debug
-//   Run:     ./build/debug/jobs/prime-counter/prime-counter
-//   Test A:  let it finish with a small TARGET (TARGET=100000 ./prime-counter).
-//            Exit code should be 0 (check with: echo $?). result.dat exists.
-//   Test B:  big TARGET, press Ctrl+C after a few autosaves. Exit code 75.
-//            Run again: it must print "resuming from ...".
-//   Test C:  run it, then from another terminal: kill -9 <pid> (can't be caught).
-//            Run again: it resumes from the last AUTOSAVE, not from 2.
-//   Test D:  final count must be the same whether or not you interrupted it.
-//            (Primes up to 1,000,000 = 78,498. Use that to check correctness.)
-// =============================================================================
+// Environment:
+//   JOB_ID           identifier used in log lines        (default "local")
+//   CHECKPOINT_DIR   directory for checkpoint and result (default "./checkpoint")
+//   TARGET           upper bound, inclusive              (default 100000000)
+//   AUTOSAVE_MS      autosave interval in milliseconds   (default 5000)
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <string_view>
+
+namespace {
+
+constexpr int kExitCompleted = 0;
+constexpr int kExitError = 1;
+constexpr int kExitInterrupted = 75;  // EX_TEMPFAIL: stopped early, safe to resume.
+
+// How many candidates to test between clock reads. Reading the clock on every
+// iteration would dominate the cost of testing small numbers.
+constexpr std::int64_t kClockCheckStride = 4096;
+
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+extern "C" void handle_stop_signal(int /*signal_number*/) {
+    g_stop_requested = 1;
+}
+
+struct Progress {
+    std::int64_t target = 0;
+    std::int64_t next_number = 2;  // next candidate to test
+    std::int64_t primes_found = 0;
+    std::int64_t last_prime = 0;
+};
+
+struct Settings {
+    std::string job_id;
+    std::filesystem::path checkpoint_dir;
+    std::int64_t target = 0;
+    std::chrono::milliseconds autosave_interval{0};
+};
+
+std::string env_or(const char* name, std::string_view fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string(value) : std::string(fallback);
+}
+
+std::optional<std::int64_t> parse_int64(const std::string& text) {
+    try {
+        std::size_t consumed = 0;
+        const long long value = std::stoll(text, &consumed);
+        if (consumed != text.size()) {
+            return std::nullopt;
+        }
+        return static_cast<std::int64_t>(value);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+bool is_prime(std::int64_t n) {
+    if (n < 2) {
+        return false;
+    }
+    if (n < 4) {
+        return true;
+    }
+    if (n % 2 == 0) {
+        return false;
+    }
+    for (std::int64_t divisor = 3; divisor <= n / divisor; divisor += 2) {
+        if (n % divisor == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string serialize(const Progress& progress) {
+    std::ostringstream out;
+    out << "version=1\n"
+        << "target=" << progress.target << '\n'
+        << "next_number=" << progress.next_number << '\n'
+        << "primes_found=" << progress.primes_found << '\n'
+        << "last_prime=" << progress.last_prime << '\n';
+    return out.str();
+}
+
+// Returns nullopt if the file is missing or malformed. A malformed checkpoint
+// is treated as absent so the job restarts cleanly instead of crashing.
+std::optional<Progress> load_checkpoint(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        return std::nullopt;
+    }
+
+    Progress progress;
+    bool has_target = false;
+    bool has_next = false;
+    bool has_found = false;
+    bool has_last = false;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, separator);
+        const auto value = parse_int64(line.substr(separator + 1));
+        if (!value) {
+            return std::nullopt;
+        }
+        if (key == "target") {
+            progress.target = *value;
+            has_target = true;
+        } else if (key == "next_number") {
+            progress.next_number = *value;
+            has_next = true;
+        } else if (key == "primes_found") {
+            progress.primes_found = *value;
+            has_found = true;
+        } else if (key == "last_prime") {
+            progress.last_prime = *value;
+            has_last = true;
+        }
+    }
+
+    if (!has_target || !has_next || !has_found || !has_last || progress.next_number < 2 ||
+        progress.primes_found < 0) {
+        return std::nullopt;
+    }
+    return progress;
+}
+
+// Writes `contents` to `path` so that a reader observes either the previous
+// file or the new one, never a partial write: write a temp file in the same
+// directory, fsync it, rename it over the target, then fsync the directory so
+// the rename itself survives a crash.
+bool write_file_atomically(const std::filesystem::path& path, const std::string& contents) {
+    const std::filesystem::path temp_path = path.string() + ".tmp";
+
+    const int fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        std::cerr << "open " << temp_path << ": " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    std::size_t written = 0;
+    while (written < contents.size()) {
+        const ssize_t n = ::write(fd, contents.data() + written, contents.size() - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "write " << temp_path << ": " << std::strerror(errno) << '\n';
+            ::close(fd);
+            return false;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+
+    if (::fsync(fd) != 0 || ::close(fd) != 0) {
+        std::cerr << "fsync/close " << temp_path << ": " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    if (::rename(temp_path.c_str(), path.c_str()) != 0) {
+        std::cerr << "rename " << temp_path << ": " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    const int dir_fd = ::open(path.parent_path().c_str(), O_RDONLY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+        ::fsync(dir_fd);
+        ::close(dir_fd);
+    }
+    return true;
+}
+
+std::optional<Settings> read_settings() {
+    Settings settings;
+    settings.job_id = env_or("JOB_ID", "local");
+    settings.checkpoint_dir = env_or("CHECKPOINT_DIR", "./checkpoint");
+
+    const auto target = parse_int64(env_or("TARGET", "100000000"));
+    const auto autosave_ms = parse_int64(env_or("AUTOSAVE_MS", "5000"));
+    if (!target || *target < 2) {
+        std::cerr << "TARGET must be an integer >= 2\n";
+        return std::nullopt;
+    }
+    if (!autosave_ms || *autosave_ms <= 0) {
+        std::cerr << "AUTOSAVE_MS must be a positive integer\n";
+        return std::nullopt;
+    }
+    settings.target = *target;
+    settings.autosave_interval = std::chrono::milliseconds(*autosave_ms);
+    return settings;
+}
+
+void install_signal_handlers() {
+    struct sigaction action {};
+    action.sa_handler = handle_stop_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;  // no SA_RESTART: interrupted syscalls should return
+    sigaction(SIGTERM, &action, nullptr);
+    sigaction(SIGINT, &action, nullptr);
+}
+
+}  // namespace
+
+int main() {
+    install_signal_handlers();
+
+    const auto settings = read_settings();
+    if (!settings) {
+        return kExitError;
+    }
+    const std::string& id = settings->job_id;
+
+    std::error_code ec;
+    std::filesystem::create_directories(settings->checkpoint_dir, ec);
+    if (ec) {
+        std::cerr << "[" << id << "] cannot create " << settings->checkpoint_dir << ": "
+                  << ec.message() << '\n';
+        return kExitError;
+    }
+    const auto checkpoint_path = settings->checkpoint_dir / "checkpoint.dat";
+    const auto result_path = settings->checkpoint_dir / "result.dat";
+
+    Progress progress;
+    progress.target = settings->target;
+    if (auto restored = load_checkpoint(checkpoint_path)) {
+        if (restored->target != settings->target) {
+            std::cerr << "[" << id << "] checkpoint is for TARGET=" << restored->target
+                      << ", expected " << settings->target << "; refusing to resume\n";
+            return kExitError;
+        }
+        progress = *restored;
+        std::cout << "[" << id << "] resuming at " << progress.next_number << " ("
+                  << progress.primes_found << " primes so far)" << std::endl;
+    } else {
+        std::cout << "[" << id << "] starting fresh, target " << settings->target << std::endl;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    auto last_save = Clock::now();
+
+    while (progress.next_number <= progress.target) {
+        if (g_stop_requested != 0) {
+            if (!write_file_atomically(checkpoint_path, serialize(progress))) {
+                return kExitError;
+            }
+            std::cout << "[" << id << "] stop requested, checkpoint saved at "
+                      << progress.next_number << std::endl;
+            return kExitInterrupted;
+        }
+
+        if (is_prime(progress.next_number)) {
+            ++progress.primes_found;
+            progress.last_prime = progress.next_number;
+        }
+        ++progress.next_number;
+
+        if (progress.next_number % kClockCheckStride == 0 &&
+            Clock::now() - last_save >= settings->autosave_interval) {
+            if (!write_file_atomically(checkpoint_path, serialize(progress))) {
+                return kExitError;
+            }
+            last_save = Clock::now();
+        }
+    }
+
+    std::ostringstream result;
+    result << "target=" << progress.target << '\n'
+           << "primes_found=" << progress.primes_found << '\n'
+           << "last_prime=" << progress.last_prime << '\n';
+    if (!write_file_atomically(result_path, result.str()) ||
+        !write_file_atomically(checkpoint_path, serialize(progress))) {
+        return kExitError;
+    }
+
+    std::cout << "[" << id << "] done: " << progress.primes_found << " primes <= "
+              << progress.target << std::endl;
+    return kExitCompleted;
+}
