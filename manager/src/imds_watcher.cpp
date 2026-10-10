@@ -1,42 +1,98 @@
-// =============================================================================
-// imds_watcher.cpp: real spot interruption warning from EC2 (PHASE 7)
-// =============================================================================
-// How Amazon tells a spot computer it's being taken back:
-//   GET http://169.254.169.254/latest/meta-data/spot/instance-action
-//     404               -> nothing is happening (the normal case)
-//     200 + JSON body   -> {"action": "terminate", "time": "2026-10-04T18:05:00Z"}
-//
-// IMDSv2 (the secure version, required on most new instances) needs a token first:
-//   PUT /latest/api/token
-//       header  X-aws-ec2-metadata-token-ttl-seconds: 21600   (token lasts 6 hours)
-//       -> body is the token text
-//   Then send header  X-aws-ec2-metadata-token: <token>  on every GET.
-//
-// STEP 1: Includes: "spot_runner/imds_watcher.h", "spot_runner/logger.h",
-//   <nlohmann/json.hpp>.  using namespace std; namespace spot_runner { ... }
-//
-// STEP 2: Constructors
-//   Default: endpoint_ = tcp_endpoint("169.254.169.254", 80)
-//   Other: store the given endpoint (tests can point at a fake server).
-//
-// STEP 3: get_token()
-//   If token_ isn't empty and now < token_expires_, return token_ (reuse it).
-//   Otherwise send the PUT above with a SHORT timeout (1000 ms). Save the token and
-//   set token_expires_ to now + 6 hours minus a safety margin (say 5 minutes).
-//
-// STEP 4: check()
-//   Everything inside try { } catch (exception& e) { log_warn(...); return nullopt; }
-//   (A temporary network blip must never crash the manager.)
-//   4a. GET /latest/meta-data/spot/instance-action with the token header, 1000 ms timeout.
-//   4b. 404 -> return nullopt.
-//   4c. 401 -> the token expired: clear token_ so the next check gets a new one.
-//   4d. 200 -> parse JSON, return InterruptionNotice{action, time}.
-//
-// BONUS (great README talking point): Amazon also sends an EARLIER, softer hint:
-//   GET /latest/meta-data/events/recommendations/rebalance
-//   200 means "this computer is at higher risk of being taken soon". On that hint you
-//   could stop taking NEW jobs while letting the current one keep running.
-//
-// You can only truly test this on EC2. Test it in Phase 8 with AWS's
-// Fault Injection Service, which can send a real interruption to your instance.
-// =============================================================================
+#include "spot_runner/imds_watcher.h"
+
+#include <nlohmann/json.hpp>
+
+#include "spot_runner/errors.h"
+#include "spot_runner/logger.h"
+
+namespace spot_runner {
+
+namespace {
+
+using nlohmann::json;
+
+constexpr const char* kImdsHost = "169.254.169.254";
+constexpr int kTokenTtlSeconds = 21600;  // 6 hours, the IMDSv2 maximum
+constexpr auto kRequestTimeout = std::chrono::milliseconds(1000);
+constexpr auto kTokenRefreshMargin = std::chrono::minutes(5);
+
+}  // namespace
+
+ImdsClient::ImdsClient() : endpoint_(Endpoint::tcp(kImdsHost, 80)) {}
+
+ImdsClient::ImdsClient(Endpoint endpoint) : endpoint_(std::move(endpoint)) {}
+
+std::string ImdsClient::token() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!token_.empty() && now < token_expiry_) {
+        return token_;
+    }
+    HttpRequest request;
+    request.method = "PUT";
+    request.target = "/latest/api/token";
+    request.headers["X-aws-ec2-metadata-token-ttl-seconds"] = std::to_string(kTokenTtlSeconds);
+    const auto response = send_request(endpoint_, request, kRequestTimeout);
+    if (response.status != 200 || response.body.empty()) {
+        throw HttpError("IMDS token request returned " + std::to_string(response.status));
+    }
+    token_ = response.body;
+    token_expiry_ = now + std::chrono::seconds(kTokenTtlSeconds) - kTokenRefreshMargin;
+    return token_;
+}
+
+std::optional<std::string> ImdsClient::get(const std::string& path) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        HttpRequest request;
+        request.target = path;
+        request.headers["X-aws-ec2-metadata-token"] = token();
+        const auto response = send_request(endpoint_, request, kRequestTimeout);
+        if (response.status == 200) {
+            return response.body;
+        }
+        if (response.status == 404) {
+            return std::nullopt;
+        }
+        if (response.status == 401) {
+            token_.clear();  // token expired or revoked; fetch a new one and retry once
+            continue;
+        }
+        throw HttpError("IMDS GET " + path + " returned " + std::to_string(response.status));
+    }
+    throw HttpError("IMDS GET " + path + " unauthorized after token refresh");
+}
+
+ImdsWatcher::ImdsWatcher(Endpoint endpoint) : client_(std::move(endpoint)) {}
+
+std::optional<InterruptionNotice> ImdsWatcher::check() {
+    try {
+        if (const auto body = client_.get("/latest/meta-data/spot/instance-action")) {
+            const auto doc = json::parse(*body);
+            InterruptionNotice notice;
+            notice.kind = InterruptionNotice::Kind::Interruption;
+            notice.action = doc.value("action", "terminate");
+            notice.time = doc.value("time", "");
+            return notice;
+        }
+        if (const auto body = client_.get("/latest/meta-data/events/recommendations/rebalance")) {
+            const auto doc = json::parse(*body);
+            InterruptionNotice notice;
+            notice.kind = InterruptionNotice::Kind::RebalanceRecommendation;
+            notice.time = doc.value("noticeTime", "");
+            return notice;
+        }
+    } catch (const std::exception& e) {
+        log::warn(std::string("IMDS check failed: ") + e.what());
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> fetch_instance_id() {
+    try {
+        ImdsClient client;
+        return client.get("/latest/meta-data/instance-id");
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+}  // namespace spot_runner

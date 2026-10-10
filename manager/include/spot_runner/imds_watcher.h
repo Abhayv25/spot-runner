@@ -1,23 +1,53 @@
-// =============================================================================
-// imds_watcher.h: the REAL interruption warning on EC2 (PHASE 7)
-// =============================================================================
-// IMDS = Instance Metadata Service: a little web server every EC2 computer can
-// reach at http://169.254.169.254. It only exists inside AWS, so this class can't
-// do anything on your Mac (that's why FileWatcher exists).
-// Uses your own http_client (plain TCP). No AWS SDK needed, so it always compiles.
+#pragma once
+
+#include <chrono>
+#include <optional>
+#include <string>
+
+#include "spot_runner/http_client.h"
+#include "spot_runner/interruption_watcher.h"
+
+namespace spot_runner {
+
+// Client for the EC2 Instance Metadata Service (IMDSv2), reachable only from
+// inside an EC2 instance at http://169.254.169.254.
 //
-// STEP 1: #pragma once
-//   includes "spot_runner/interruption_watcher.h", "spot_runner/http_client.h", <chrono>
-//   namespace spot_runner
-//
-// STEP 2: class ImdsWatcher : public InterruptionWatcher
-//   public:
-//     ImdsWatcher();                       // default endpoint 169.254.169.254:80
-//     explicit ImdsWatcher(const Endpoint& endpoint);  // lets tests point it elsewhere
-//     std::optional<InterruptionNotice> check() override;
-//   private:
-//     std::string get_token();             // IMDSv2 needs a session token (see .cpp)
-//     Endpoint endpoint_;
-//     std::string token_;
-//     std::chrono::steady_clock::time_point token_expires_;
-// =============================================================================
+// IMDSv2 is session-based: PUT /latest/api/token returns a token that must be
+// sent as X-aws-ec2-metadata-token on every GET. The token is cached until
+// shortly before it expires and refreshed on a 401.
+class ImdsClient {
+public:
+    ImdsClient();
+    explicit ImdsClient(Endpoint endpoint);
+
+    // GET a metadata path. Returns nullopt on 404, the body on 200; throws
+    // HttpError on transport failures or other statuses.
+    std::optional<std::string> get(const std::string& path);
+
+private:
+    std::string token();
+
+    Endpoint endpoint_;
+    std::string token_;
+    std::chrono::steady_clock::time_point token_expiry_{};
+};
+
+// Polls IMDS for spot interruption notices and rebalance recommendations:
+//   /latest/meta-data/spot/instance-action               404 until a notice exists
+//   /latest/meta-data/events/recommendations/rebalance   404 until a recommendation
+class ImdsWatcher : public InterruptionWatcher {
+public:
+    ImdsWatcher() = default;
+    explicit ImdsWatcher(Endpoint endpoint);
+
+    std::optional<InterruptionNotice> check() override;
+
+private:
+    ImdsClient client_;
+};
+
+// Returns this instance's ID (for example "i-0abc123..."), or nullopt when not
+// on EC2. Fails fast: each IMDS request has a one-second timeout.
+std::optional<std::string> fetch_instance_id();
+
+}  // namespace spot_runner
