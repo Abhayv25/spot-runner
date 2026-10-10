@@ -1,27 +1,70 @@
-// =============================================================================
-// logger.cpp (PHASE 3)
-// =============================================================================
-// STEP 1: Includes: "spot_runner/logger.h", <iostream>, <chrono>, <ctime>, <iomanip>
-//   using namespace std;  namespace spot_runner { ... }
-//
-// STEP 2: File-level state (put it inside an unnamed namespace { } so it's private
-//   to this file; same effect as "static" globals):
-//     LogLevel g_min_level = LogLevel::Info;
-//     string g_prefix;
-//
-// STEP 3: A private helper (also in the unnamed namespace):
-//   void write_line(LogLevel level, const string& message)
-//     - If level < g_min_level, return. (enum class values compare in declared order)
-//     - Get the current UTC time: chrono::system_clock::now() -> time_t -> gmtime_r.
-//       Format with put_time(&tm, "%Y-%m-%dT%H:%M:%SZ").
-//     - Level text padded to 5 chars: "DEBUG", "INFO ", "WARN ", "ERROR".
-//     - Print:  time level [prefix] message
-//     - Warn/Error go to cerr, the rest to cout. End with endl (flushes; logs that
-//       sit in a buffer when the process is killed are lost forever).
-//
-// STEP 4: Define the 6 public functions; each is one line calling write_line,
-//   except the two setters.
-//
-// Later (optional): add a LOG_FORMAT=json mode that prints one JSON object per
-// line. Cloud log tools (like CloudWatch) can search those by field.
-// =============================================================================
+#include "spot_runner/logger.h"
+
+#include <iostream>
+#include <mutex>
+
+#include "spot_runner/util.h"
+
+namespace spot_runner::log {
+
+namespace {
+
+std::mutex g_mutex;
+LogLevel g_level = LogLevel::Info;
+std::string g_component;
+
+std::string_view level_name(LogLevel level) {
+    switch (level) {
+        case LogLevel::Debug:
+            return "DEBUG";
+        case LogLevel::Info:
+            return "INFO ";
+        case LogLevel::Warn:
+            return "WARN ";
+        case LogLevel::Error:
+            return "ERROR";
+    }
+    return "?????";
+}
+
+void write(LogLevel level, std::string_view message) {
+    const std::string timestamp = format_iso8601(unix_millis());
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (level < g_level) {
+        return;
+    }
+    std::cerr << timestamp << ' ' << level_name(level) << ' ';
+    if (!g_component.empty()) {
+        std::cerr << '[' << g_component << "] ";
+    }
+    // std::endl flushes; a log line still sitting in a buffer when the
+    // process is killed is a log line that never existed.
+    std::cerr << message << std::endl;
+}
+
+}  // namespace
+
+void set_level(LogLevel level) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_level = level;
+}
+
+void set_component(std::string component) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_component = std::move(component);
+}
+
+void debug(std::string_view message) {
+    write(LogLevel::Debug, message);
+}
+void info(std::string_view message) {
+    write(LogLevel::Info, message);
+}
+void warn(std::string_view message) {
+    write(LogLevel::Warn, message);
+}
+void error(std::string_view message) {
+    write(LogLevel::Error, message);
+}
+
+}  // namespace spot_runner::log

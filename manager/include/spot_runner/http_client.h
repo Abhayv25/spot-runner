@@ -1,43 +1,63 @@
-// =============================================================================
-// http_client.h: a tiny HTTP/1.1 client written from scratch (PHASE 5)
-// =============================================================================
-// This is the most "systems" file in the project. You'll talk raw HTTP over sockets.
-// Two things use it:
-//   1. DockerClient: Docker listens on a Unix socket (a file like /var/run/docker.sock)
-//   2. ImdsWatcher:  Amazon's metadata service is plain TCP at 169.254.169.254:80
-// Same HTTP text either way, just a different kind of socket underneath.
-//
-// STEP 1: #pragma once, includes <string>, <map>, <stdexcept>, namespace spot_runner
-//
-// STEP 2: struct HttpRequest
-//   std::string method;                          // "GET", "POST", "PUT", "DELETE"
-//   std::string path;                            // "/containers/json?all=1"
-//   std::map<std::string, std::string> headers;
-//   std::string body;                            // usually JSON, may be empty
-//
-// STEP 3: struct HttpResponse
-//   int status_code = 0;                         // 200, 404, ...
-//   std::map<std::string, std::string> headers;  // store keys in lowercase!
-//   std::string body;                            // already de-chunked (see .cpp)
-//
-// STEP 4: struct Endpoint (where to connect)
-//   bool use_unix_socket = false;
-//   std::string unix_socket_path;                // when use_unix_socket is true
-//   std::string host;                            // when false, e.g. "169.254.169.254"
-//   int port = 80;
-//   Add two small helper prototypes that build one:
-//     Endpoint unix_endpoint(const std::string& socket_path);
-//     Endpoint tcp_endpoint(const std::string& host, int port);
-//
-// STEP 5: struct HttpError : public std::runtime_error
-//   (Inherit the constructor: using std::runtime_error::runtime_error;)
-//   Throw this for connection failures, timeouts, and bad responses.
-//
-// STEP 6: Prototypes
-//   HttpResponse send_request(const Endpoint& endpoint, const HttpRequest& request,
-//                             int timeout_ms);
-//
-//   These two are separate on purpose so tests can check them with NO network:
-//   std::string build_request_text(const HttpRequest& request, const std::string& host_header);
-//   HttpResponse parse_response_text(const std::string& raw);
-// =============================================================================
+#pragma once
+
+#include <chrono>
+#include <map>
+#include <string>
+#include <string_view>
+
+namespace spot_runner {
+
+// Minimal HTTP/1.1 client over POSIX sockets. It exists so the manager can
+// talk to two local services without pulling in libcurl:
+//   - the Docker Engine API, over the Unix socket /var/run/docker.sock
+//   - the EC2 Instance Metadata Service, over TCP at 169.254.169.254:80
+// Both are plain-HTTP, request/response services on a trusted local path, so
+// every request uses "Connection: close" and the response ends at EOF. TLS,
+// keep-alive, and redirects are intentionally out of scope.
+
+struct Endpoint {
+    enum class Kind { UnixSocket, Tcp };
+
+    Kind kind = Kind::Tcp;
+    std::string unix_path;  // Kind::UnixSocket
+    std::string host;       // Kind::Tcp
+    int port = 80;
+
+    static Endpoint unix_socket(std::string path);
+    static Endpoint tcp(std::string host, int port);
+};
+
+// Header names are stored lowercase; HTTP header names are case-insensitive.
+using HeaderMap = std::map<std::string, std::string>;
+
+struct HttpRequest {
+    std::string method = "GET";
+    std::string target = "/";  // path plus optional query string
+    HeaderMap headers;
+    std::string body;
+};
+
+struct HttpResponse {
+    int status = 0;
+    HeaderMap headers;
+    std::string body;  // already de-chunked
+};
+
+// Serializes a request. Always sets Host, Content-Length, and Connection: close.
+std::string serialize_request(const HttpRequest& request, std::string_view host_header);
+
+// Parses a complete response (status line, headers, and body read to EOF).
+// Decodes chunked transfer encoding and honors Content-Length. Throws HttpError
+// on malformed input.
+HttpResponse parse_response(std::string_view raw);
+
+// Sends the request and returns the full response. `timeout` bounds the whole
+// exchange (connect, send, and receive). Throws HttpError on transport errors;
+// HTTP error statuses (4xx/5xx) are returned, not thrown.
+HttpResponse send_request(const Endpoint& endpoint, const HttpRequest& request,
+                          std::chrono::milliseconds timeout);
+
+// Percent-encodes a query string component (RFC 3986 unreserved set kept).
+std::string url_encode(std::string_view text);
+
+}  // namespace spot_runner

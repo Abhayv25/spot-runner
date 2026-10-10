@@ -1,21 +1,23 @@
-// =============================================================================
-// logger.h: simple timestamped logging (PHASE 3)
-// =============================================================================
-// Every line the manager prints goes through here, so all logs look the same:
-//   2026-10-04T18:02:11Z INFO  [laptop-1] job-001 started (container 3f2a91)
-// Good logs are how you'll debug this AND how you'll show it working in your demo.
-//
-// STEP 1: #pragma once, includes <string>, namespace spot_runner { }
-//
-// STEP 2: enum class LogLevel { Debug, Info, Warn, Error };
-//
-// STEP 3: Prototypes
-//   void set_log_level(LogLevel minimum);         // lines below this level are skipped
-//   void set_log_prefix(const std::string& prefix); // e.g. the manager_id
-//   void log_debug(const std::string& message);
-//   void log_info(const std::string& message);
-//   void log_warn(const std::string& message);
-//   void log_error(const std::string& message);
-//
-// (Simple free functions are fine here. A Logger class is optional.)
-// =============================================================================
+#pragma once
+
+#include <string>
+#include <string_view>
+
+namespace spot_runner {
+
+enum class LogLevel { Debug = 0, Info = 1, Warn = 2, Error = 3 };
+
+// Human-readable diagnostic log written to stderr. Thread-safe.
+//   2026-10-10T16:40:01.123Z INFO  [laptop-1] claimed job-001 (attempt 1)
+namespace log {
+
+void set_level(LogLevel level);
+void set_component(std::string component);
+
+void debug(std::string_view message);
+void info(std::string_view message);
+void warn(std::string_view message);
+void error(std::string_view message);
+
+}  // namespace log
+}  // namespace spot_runner
