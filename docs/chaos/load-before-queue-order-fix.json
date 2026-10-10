@@ -1,0 +1,65 @@
+{
+  "config": {
+    "managers": 3,
+    "jobs": 30,
+    "runtime": "docker",
+    "seed": 7,
+    "lease_s": 6,
+    "sync_ms": 1000,
+    "autosave_ms": 1000,
+    "target_range": [
+      16258145,
+      42744553
+    ]
+  },
+  "wall_clock_s": 230.3,
+  "faults_injected": {
+    "graceful_interruptions": 13,
+    "hard_kills": 23,
+    "jobs_hard_killed_mid_run": 22
+  },
+  "correctness": {
+    "jobs_correct": 30,
+    "jobs_wrong": [],
+    "jobs_missing": [],
+    "dead_lettered": 0,
+    "concurrent_ownership_violations": 0
+  },
+  "activity": {
+    "attempts_started": 64,
+    "checkpoints_uploaded": 614,
+    "jobs_resumed_from_checkpoint": 34
+  },
+  "graceful_handoff": {
+    "name": "notice -> checkpoint saved and job released",
+    "count": 12,
+    "p50_s": 0.21,
+    "p95_s": 0.27,
+    "max_s": 0.28,
+    "mean_s": 0.22
+  },
+  "graceful_resume": {
+    "name": "released -> resumed on another manager",
+    "count": 12,
+    "p50_s": 56.79,
+    "p95_s": 87.99,
+    "max_s": 109.99,
+    "mean_s": 56.46
+  },
+  "hard_kill_recovery": {
+    "name": "kill -> resumed on another manager",
+    "count": 22,
+    "p50_s": 51.62,
+    "p95_s": 102.13,
+    "max_s": 106.43,
+    "mean_s": 53.63
+  },
+  "work_lost_per_hard_kill": {
+    "name": "kill - last durable checkpoint",
+    "count": 22,
+    "p50_s": 0.49,
+    "p95_s": 0.83,
+    "max_s": 0.86,
+    "mean_s": 0.49
+  }
+}
