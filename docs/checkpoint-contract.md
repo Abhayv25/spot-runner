@@ -1,78 +1,67 @@
-# The Checkpoint Contract
+# Checkpoint contract
 
-This is the agreement between the **manager** and any **job**. Every job that follows these
-rules can be run by the manager, whatever the job actually does inside its box. Read this
-before writing `jobs/prime-counter/main.cpp` and `manager/src/job_runner.cpp`, because both
-must agree on it exactly.
+Any program can run under spot-runner if it follows these rules. The manager
+never looks inside a checkpoint; the format belongs entirely to the job.
 
-## 1. What the manager gives the job (environment variables)
+## Inputs
 
-| Variable | Example | Meaning |
+| Variable | Set by | Meaning |
 |---|---|---|
-| `JOB_ID` | `job-001` | The job's name. Use it in log messages. |
-| `CHECKPOINT_DIR` | `/checkpoint` | The shared folder. Read and write save files here and nowhere else. |
-| anything in the job message's `env` | `TARGET=300000000` | Job-specific settings. The manager passes these through untouched. |
+| `CHECKPOINT_DIR` | manager | Directory for checkpoints and results. `/checkpoint` in a container; a host path under the process runtime. |
+| `JOB_ID` | manager | The job's ID, for log lines. |
+| `SPOT_RUNNER_ATTEMPT` | manager | 1 on the first attempt, incremented after each failure. |
+| anything in the job message's `env` | submitter | Job-specific settings, passed through untouched. |
 
-`CHECKPOINT_DIR` is always `/checkpoint` inside the container. On the outside, the manager
-connects it to `<work_dir>/<job_id>/` on the computer (a Docker **bind mount**).
+## Files
 
-## 2. Files in the shared folder
-
-| File | Who writes it | Meaning |
+| File | Written by | Meaning |
 |---|---|---|
-| `checkpoint.dat` | job | The save file. The **manager never reads what's inside**, it only uploads and downloads it. The format belongs to the job. |
-| `result.dat` | job | Written once, only when the job has fully finished. |
-| `*.tmp` | job | Half-written files. The manager must ignore these. |
+| `checkpoint.dat` | job | Latest progress. Uploaded to storage whenever it changes. |
+| `result.dat` | job | Final output. Written exactly once, when the work is complete. |
+| `*.tmp*` | job | In-progress writes. Ignored by the manager. |
 
-**Atomic writes rule:** the job must never write `checkpoint.dat` directly. It writes
-`checkpoint.dat.tmp`, flushes it to disk, then **renames** it to `checkpoint.dat`. A rename is
-all-or-nothing, so the manager can never see a half-written save file.
+Writes must be atomic: write a temporary file in the same directory, `fsync`
+it, then `rename` it over the target. `rename` within a filesystem replaces the
+destination in one step, so the manager (or a crash) can never observe half a
+checkpoint.
 
-## 3. How the job starts
+## Lifecycle
 
-1. If `/checkpoint/checkpoint.dat` exists, load it and continue from there.
-2. Otherwise, start from the beginning.
-3. Print one log line saying which of these happened (this is how you'll prove resume works).
+1. **Start.** If `checkpoint.dat` exists, resume from it; otherwise start fresh.
+   A checkpoint that fails to parse is treated as absent.
+2. **Run.** Rewrite `checkpoint.dat` periodically. The interval bounds the work
+   lost if the machine disappears without warning.
+3. **Stop request.** On `SIGTERM` (and `SIGINT`), write a final checkpoint and
+   exit promptly. The manager allows `stop_grace_period_s` before `SIGKILL`.
+4. **Finish.** Write `result.dat`, then exit 0.
 
-## 4. While the job runs
+## Exit codes
 
-- **Autosave** every `AUTOSAVE_SECONDS` (default 10) using the atomic writes rule.
-- Check a "should I stop?" flag often (at least once per second of work).
-
-## 5. How the job stops (exit codes)
-
-| Exit code | Meaning | What the manager does |
+| Code | Meaning | Manager action |
 |---|---|---|
-| `0` | Finished. `result.dat` is written. | Uploads the result, deletes the job from the queue. |
-| `75` | Asked to stop, final checkpoint saved. | Uploads the checkpoint, puts the job back on the queue. |
-| anything else | Crashed or failed. | Counts an attempt. Retries from the last uploaded checkpoint, or gives up after `max_attempts`. |
+| 0 | Done; `result.dat` exists | Upload result, delete the job from the queue |
+| 75 | Stopped on request; checkpoint saved | Upload checkpoint, requeue without counting a failure |
+| other | Crashed | Upload last checkpoint, requeue with `attempts + 1`, dead-letter after `max_attempts` |
 
-`75` is the standard Unix code for "temporary failure, try again later" (`EX_TEMPFAIL`).
+75 is `EX_TEMPFAIL` from `sysexits.h`: a temporary failure, try again later.
+A job killed by a signal is reported as `128 + signal`, so `137` is `SIGKILL`.
 
-**The stop signal:** Docker sends the program `SIGTERM` when asked to stop. The job catches
-it, sets its "should I stop?" flag, writes a final checkpoint, and exits with `75`. The job
-should also treat `SIGINT` (Ctrl+C) the same way, so you can test it without Docker.
-
-If the job doesn't exit within the grace period, Docker kills it with `SIGKILL`, which can't
-be caught. That's why autosave matters: the last autosave is the fallback.
-
-## 6. Where things live in storage
-
-Storage keys (folder-like paths in the local storage folder or the S3 bucket):
+## Storage layout
 
 ```
-jobs/<job_id>/checkpoint.dat
-jobs/<job_id>/result.dat
+<prefix>jobs/<job_id>/checkpoint.dat
+<prefix>jobs/<job_id>/result.dat
 ```
 
-## 7. The job message (what sits on the queue)
+## Job message
 
 ```json
 {
-  "job_id": "job-001",
+  "job_id": "primes-50m",
   "image": "prime-counter:latest",
-  "env": { "TARGET": "300000000", "AUTOSAVE_SECONDS": "5" }
+  "env": { "TARGET": "50000000", "AUTOSAVE_MS": "2000" }
 }
 ```
 
-The manager adds bookkeeping (how many attempts, the lease) itself. You never write that by hand.
+`job_id` may contain letters, digits, `-`, `_`, and `.` (max 128 characters),
+because it becomes a file name, an S3 key segment, and a container name.

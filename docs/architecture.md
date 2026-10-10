@@ -1,50 +1,108 @@
 # Architecture
 
-## The pieces
+## Components
 
 ```
-                     ┌──────────────── one cheap (spot) computer ────────────────┐
-                     │                                                            │
- ┌──────────────┐    │  ┌──────────────────── manager (C++) ───────────────────┐  │
- │  Job queue   │◄───┼──┤ JobRunner                                            │  │
- │ LocalQueue / │    │  │   uses: Storage, JobQueue, ContainerRuntime,         │  │
- │ SQS          │    │  │         InterruptionWatcher (interfaces)             │  │
- └──────────────┘    │  └───────┬───────────────────┬────────────────┬────────┘  │
-                     │          │ HTTP over          │ checks every    │           │
- ┌──────────────┐    │          │ Unix socket        │ second          │           │
- │   Storage    │◄───┼──────────┼─── uploads ───┐    ▼                 │           │
- │ LocalStorage │    │          ▼               │  FileWatcher /      │           │
- │ / S3         │    │   ┌─────────────┐        │  ImdsWatcher        │           │
- └──────────────┘    │   │   Docker    │        │                     │           │
-                     │   └──────┬──────┘        │                     │           │
-                     │          │ runs           │                     │           │
-                     │   ┌──────▼──────────────┐ │                     │           │
-                     │   │ job container       │ │                     │           │
-                     │   │ (prime-counter)     │ │                     │           │
-                     │   │   /checkpoint ◄─────┼─┴── shared folder ───┘           │
-                     │   └─────────────────────┘     (bind mount)                 │
-                     └────────────────────────────────────────────────────────────┘
+                   +---------------------- one spot instance ----------------------+
+                   |                                                                |
+ +-------------+   |   +------------------------- manager -----------------------+  |
+ |  job queue  |<--+---|  JobRunner (control loop)                               |  |
+ |  SQS        |   |   |    depends only on four interfaces:                     |  |
+ +-------------+   |   |    JobQueue, Storage, ContainerRuntime,                 |  |
+                   |   |    InterruptionWatcher                                  |  |
+ +-------------+   |   +------+-----------------------+-------------------------+  |
+ |  storage    |<--+----------|  checkpoint uploads   | HTTP/1.1 over           |  |
+ |  S3         |   |          |                       | /var/run/docker.sock    |  |
+ +-------------+   |          |                       v                         |  |
+                   |          |                +-------------+     IMDSv2 poll  |  |
+                   |          |                |   Docker    |   (169.254.      |  |
+                   |          |                +------+------+    169.254.254)  |  |
+                   |          |                       | runs                    |  |
+                   |          |                +------v-----------------+       |  |
+                   |          +--------------->| job container          |       |  |
+                   |             bind mount    | /checkpoint            |       |  |
+                   |                           +------------------------+       |  |
+                   +----------------------------------------------------------------+
 ```
 
-## Same code, three environments
-
-| Interface | Tests | Your Mac | AWS |
+| Interface | Production | Local development | Unit tests |
 |---|---|---|---|
-| Storage | LocalStorage (temp dir) | LocalStorage (`run/storage`) | S3Storage |
-| JobQueue | LocalQueue (temp dir) | LocalQueue (`run/queue`) | SqsQueue |
-| ContainerRuntime | FakeRuntime | DockerClient | DockerClient |
-| InterruptionWatcher | FakeWatcher | FileWatcher | ImdsWatcher |
+| `JobQueue` | `SqsQueue` | `LocalQueue` (directory + flock) | `LocalQueue` on a temp dir |
+| `Storage` | `S3Storage` | `LocalStorage` | `LocalStorage` on a temp dir |
+| `ContainerRuntime` | `DockerClient` | `DockerClient` or `ProcessRuntime` | `FakeRuntime` |
+| `InterruptionWatcher` | `ImdsWatcher` | `FileWatcher` | `FakeWatcher` |
 
-JobRunner never changes. Only `main.cpp` decides which real piece to plug in.
+`main.cpp` is the only place that knows which implementation is in use.
 
-## Guarantees (what you'll claim, and test)
+## Control loop
 
-1. **No lost jobs.** A job is only deleted from the queue after its result is uploaded.
-   If anything dies first, the lease runs out and the job comes back.
-2. **Bounded lost work.** At most one autosave interval of work is lost per interruption,
-   even if the computer vanishes instantly.
-3. **No corrupt saves.** Every write is tmp-then-rename (or an S3 upload, which is
-   all-or-nothing).
-4. **At-least-once, not exactly-once.** In rare crash timing, a job can run twice. That's
-   safe because jobs resume from checkpoints and results overwrite. Say this honestly in
-   interviews; knowing the trade-off is the point.
+```
+run():
+    remove containers left behind by a previous crash of this manager
+    loop:
+        if shutdown requested or interruption notice: stop
+        if rebalance recommendation: stop after the current job (drain)
+        job = queue.receive(lease)            # hidden from other managers
+        if none: back off, retry
+        run_one(job)
+
+run_one(job):
+    download checkpoint from storage into the work dir (if one exists)
+    start container with the work dir mounted at /checkpoint
+    every poll interval:
+        container exited?                      -> finish()
+        interruption or shutdown?              -> docker stop (SIGTERM, grace), finish()
+        checkpoint changed since last sync?    -> renew lease, upload
+        lease due for renewal?                 -> renew lease
+finish(exit code):
+    0         upload result, delete from queue
+    75 / we stopped it   upload checkpoint, requeue (no failure counted)
+    other     upload checkpoint, requeue with attempts+1 or dead-letter
+```
+
+## Failure modes
+
+| What happens | What the system does | Work lost |
+|---|---|---|
+| Two-minute interruption notice | Stop job, upload final checkpoint, release to queue | None |
+| Instance vanishes with no notice | Lease expires; another manager claims the job and resumes from the last uploaded checkpoint | Time since last upload (bounded by autosave + sync interval) |
+| Manager process crashes | Same as above; on restart the manager removes its orphaned containers | Same |
+| Job crashes | Requeue with `attempts + 1`; dead-letter after `max_attempts` | Time since last upload |
+| Lease lost while running (manager stalled) | Stop the job, upload nothing, walk away | Nothing durable is overwritten |
+| Rebalance recommendation | Finish the current job, take no new ones, exit | None |
+| Storage or queue call fails | Exception is caught; job is requeued or its lease expires | Bounded as above |
+
+## Guarantees
+
+1. **No lost jobs.** A job leaves the queue only after its result is durable
+   (`complete` runs after the result upload). Every other path either releases
+   it or lets its lease expire.
+2. **Bounded lost work.** At most one autosave interval plus one sync interval,
+   even if the machine disappears instantly.
+3. **No torn checkpoints.** Every write is temp-file-plus-rename or a single S3
+   PutObject, both all-or-nothing.
+4. **At-least-once execution, single active owner.** A job can be executed more
+   than once (that is what resuming is), but leases plus renew-before-upload
+   fencing keep two managers from both uploading for the same job at the same
+   time. The chaos test checks this from the event logs.
+
+## Timing budget for an interruption
+
+EC2 gives about 120 seconds between the notice and termination.
+
+| Step | Default (AWS config) |
+|---|---|
+| Notice detected | within `poll_interval` (1 s) |
+| Job writes final checkpoint and exits | within `stop_grace_period_s` (60 s) |
+| Upload final checkpoint, release message | typically under 1 s for small checkpoints |
+| Reserve | the config loader rejects `stop_grace_period_s > 100` |
+
+If any step overruns, the last periodic upload is the fallback.
+
+## Concurrency model
+
+The manager is single-threaded apart from one signal thread. `SIGINT` and
+`SIGTERM` are blocked in all threads and received synchronously with
+`sigwait()`, so the handler can log and call `JobRunner::request_stop()` (an
+atomic store) without async-signal-safety concerns. The process runtime
+unblocks the signals in the child between `fork()` and `execve()`.
