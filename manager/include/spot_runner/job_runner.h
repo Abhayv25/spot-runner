@@ -1,54 +1,103 @@
-// =============================================================================
-// job_runner.h: THE BRAIN of the manager (PHASE 6)
-// =============================================================================
-// Takes jobs from the queue, runs them in containers, uploads checkpoints, and
-// handles the 2-minute warning. It only knows the INTERFACES (Storage, JobQueue,
-// ContainerRuntime, InterruptionWatcher), never the real classes. So the same
-// JobRunner works on your Mac, on AWS, and in tests with fakes.
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <string>
+
+#include "spot_runner/config.h"
+#include "spot_runner/container_runtime.h"
+#include "spot_runner/event_log.h"
+#include "spot_runner/interruption_watcher.h"
+#include "spot_runner/job_queue.h"
+#include "spot_runner/storage.h"
+
+namespace spot_runner {
+
+enum class JobOutcome {
+    Completed,     // exit 0, result uploaded, removed from the queue
+    Interrupted,   // stopped for an interruption or shutdown, checkpoint uploaded, requeued
+    Failed,        // crashed, requeued with attempts + 1
+    DeadLettered,  // crashed max_attempts times, parked in the dead-letter queue
+    LeaseLost,     // our claim expired; another manager may own the job, so we backed off
+};
+
+const char* to_string(JobOutcome outcome);
+
+struct RunnerStats {
+    int completed = 0;
+    int interrupted = 0;
+    int failed = 0;
+    int dead_lettered = 0;
+    int lease_lost = 0;
+    int checkpoints_uploaded = 0;
+    bool received_interruption = false;
+};
+
+// The manager's control loop. Claims jobs from the queue, runs each one in the
+// container runtime, mirrors its checkpoints to durable storage, renews its
+// lease, and on an interruption notice stops the job gracefully, uploads the
+// final checkpoint, and hands the job back to the queue.
 //
-// STEP 1: #pragma once
-//   includes: config.h, storage.h, job_queue.h, container_runtime.h,
-//             interruption_watcher.h, <atomic>, <chrono>
-//   namespace spot_runner
-//
-// STEP 2: enum class JobOutcome
-//   Finished,        // exit 0, result uploaded, job deleted from queue
-//   Checkpointed,    // stopped on purpose, checkpoint uploaded, job put back
-//   Failed,          // crashed, put back with attempts + 1
-//   GaveUp           // crashed too many times, sent to dead letters
-//
-// STEP 3: struct RunnerStats (you'll put these numbers in your README!)
-//   int jobs_finished = 0, jobs_checkpointed = 0, jobs_failed = 0;
-//   int checkpoints_uploaded = 0;
-//   bool interrupted = false;
-//
-// STEP 4: class JobRunner
-//   public:
-//     JobRunner(const Config& config, Storage& storage, JobQueue& queue,
-//               ContainerRuntime& runtime, InterruptionWatcher& watcher);
-//         (Take references and store references. JobRunner does NOT own these.)
-//
-//     // Main loop. Returns when interrupted, when request_stop() is called, or
-//     // (if max_jobs > 0) after that many jobs. max_jobs makes testing easy.
-//     RunnerStats run(int max_jobs = 0);
-//
-//     // Called from the manager's own SIGTERM/SIGINT handler (via a flag in main.cpp).
-//     void request_stop();
-//
-//   private:
-//     JobOutcome run_one(Job& job);
-//     void restore_checkpoint(const Job& job, const std::string& local_dir);
-//     bool upload_checkpoint_if_changed(const Job& job, const std::string& local_dir);
-//     JobOutcome finish(Job& job, int exit_code, const std::string& local_dir);
-//     bool should_stop();      // watcher says interrupt OR request_stop() was called
-//     std::string absolute_job_dir(const Job& job) const;
-//
-//     const Config& config_;
-//     Storage& storage_;
-//     JobQueue& queue_;
-//     ContainerRuntime& runtime_;
-//     InterruptionWatcher& watcher_;
-//     std::atomic<bool> stop_requested_{false};
-//     RunnerStats stats_;
-//     (plus a file_time_type to remember the last uploaded checkpoint's modified time)
-// =============================================================================
+// JobRunner depends only on interfaces, so the same code runs against AWS
+// (S3, SQS, IMDS, Docker), against local stand-ins, and against test fakes.
+// It does not own its collaborators; they must outlive it.
+class JobRunner {
+public:
+    JobRunner(const Config& config, std::string manager_id, Storage& storage, JobQueue& queue,
+              ContainerRuntime& runtime, InterruptionWatcher& watcher, EventLog& events);
+
+    // Runs until interrupted, until request_stop(), until the queue is empty
+    // (if exit_when_idle), or until `max_jobs` jobs have been processed (0 = no limit).
+    RunnerStats run(int max_jobs = 0);
+
+    // Graceful shutdown: the current job is checkpointed and requeued, exactly
+    // as for an interruption. Safe to call from any thread.
+    void request_stop();
+
+private:
+    enum class StopReason { None, Interruption, Shutdown };
+
+    struct ActiveJob {
+        Job job;
+        int attempt = 0;
+        std::string handle;
+        std::filesystem::path dir;
+        std::chrono::steady_clock::time_point claimed_at;
+        std::filesystem::file_time_type uploaded_mtime{};
+        std::uintmax_t uploaded_size = 0;
+        bool has_uploaded = false;
+    };
+
+    JobOutcome run_one(Job job);
+    JobOutcome finish(ActiveJob& active, int exit_code, bool stopped_by_us);
+    JobOutcome handle_failure(ActiveJob& active, const std::string& reason);
+    JobOutcome handle_lease_lost(ActiveJob& active, const std::string& reason);
+    // Removes the container and the local work directory. Never throws.
+    void cleanup(ActiveJob& active) noexcept;
+
+    // Uploads the job's checkpoint if it changed since the last upload. Renews
+    // the lease first, so a manager that has lost its claim cannot overwrite a
+    // newer checkpoint written by the job's new owner. Throws LeaseLostError.
+    bool sync_checkpoint(ActiveJob& active);
+
+    // Checks for shutdown requests and interruption notices.
+    void poll_signals();
+    // Sleeps for `duration`, waking early if a stop is requested.
+    void sleep_interruptible(std::chrono::milliseconds duration);
+
+    const Config& config_;
+    std::string manager_id_;
+    Storage& storage_;
+    JobQueue& queue_;
+    ContainerRuntime& runtime_;
+    InterruptionWatcher& watcher_;
+    EventLog& events_;
+
+    std::atomic<bool> shutdown_requested_{false};
+    StopReason stop_reason_ = StopReason::None;
+    bool draining_ = false;
+    RunnerStats stats_;
+};
+
+}  // namespace spot_runner
