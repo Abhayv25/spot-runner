@@ -1,16 +1,28 @@
-// =============================================================================
-// local_storage.h: Storage backed by a folder (PHASE 4)
-// =============================================================================
-// Pretends to be S3 using ./run/storage on your Mac. Everything above this layer
-// can't tell the difference, which is the whole point.
-//
-// STEP 1: #pragma once, include "spot_runner/storage.h", namespace spot_runner
-//
-// STEP 2: class LocalStorage : public Storage
-//   public:
-//     explicit LocalStorage(const std::string& root_dir);  // creates the folder if needed
-//     The 4 interface functions with "override".
-//   private:
-//     std::string path_for(const std::string& key) const;  // root_dir + "/" + key
-//     std::string root_dir_;
-// =============================================================================
+#pragma once
+
+#include <filesystem>
+#include <string>
+
+#include "spot_runner/storage.h"
+
+namespace spot_runner {
+
+// Storage backed by a local directory. Stands in for S3 during development and
+// tests; uploads use temp-file + rename so they are atomic like S3 PUTs.
+class LocalStorage : public Storage {
+public:
+    explicit LocalStorage(const std::string& root_dir);
+
+    void put_file(const std::string& key, const std::string& local_path) override;
+    bool get_file(const std::string& key, const std::string& local_path) override;
+    bool exists(const std::string& key) override;
+    void remove(const std::string& key) override;
+
+private:
+    // Rejects keys that would escape the root directory.
+    std::filesystem::path path_for(const std::string& key) const;
+
+    std::filesystem::path root_;
+};
+
+}  // namespace spot_runner
