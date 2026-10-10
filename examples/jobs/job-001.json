@@ -1,8 +1,0 @@
-{
-  "job_id": "job-001",
-  "image": "prime-counter:latest",
-  "env": {
-    "TARGET": "300000000",
-    "AUTOSAVE_SECONDS": "5"
-  }
-}

@@ -1,0 +1,26 @@
+{
+  "backend": "aws",
+  "runtime": "docker",
+  "manager_id": "auto",
+  "work_dir": "/var/lib/spot-runner/work",
+  "event_log": "/var/log/spot-runner/events.jsonl",
+  "max_attempts": 3,
+  "drain_on_rebalance": true,
+  "timing": {
+    "poll_interval_ms": 1000,
+    "checkpoint_sync_interval_ms": 15000,
+    "lease_duration_s": 120,
+    "stop_grace_period_s": 60,
+    "idle_backoff_ms": 1000
+  },
+  "docker": {
+    "socket": "/var/run/docker.sock"
+  },
+  "aws": {
+    "region": "us-east-1",
+    "bucket": "REPLACE_WITH_TERRAFORM_OUTPUT_checkpoint_bucket",
+    "queue_url": "REPLACE_WITH_TERRAFORM_OUTPUT_queue_url",
+    "dead_letter_queue_url": "REPLACE_WITH_TERRAFORM_OUTPUT_dead_letter_queue_url",
+    "key_prefix": "spot-runner/"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "backend": "local",
+  "runtime": "docker",
+  "manager_id": "local-1",
+  "work_dir": "./run/work/local-1",
+  "event_log": "./run/events/local-1.jsonl",
+  "max_attempts": 3,
+  "timing": {
+    "poll_interval_ms": 500,
+    "checkpoint_sync_interval_ms": 2000,
+    "lease_duration_s": 30,
+    "stop_grace_period_s": 30,
+    "idle_backoff_ms": 1000
+  },
+  "docker": {
+    "socket": "/var/run/docker.sock"
+  },
+  "local": {
+    "storage_dir": "./run/storage",
+    "queue_dir": "./run/queue",
+    "interrupt_file": "./run/interrupt-local-1"
+  }
+}

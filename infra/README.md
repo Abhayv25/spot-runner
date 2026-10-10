@@ -1,48 +1,77 @@
-# infra/: AWS setup (Phases 7 and 8, YOUR TURN)
+# Deploying to AWS
 
-This folder is yours. Nothing is pre-made on purpose, so you learn each piece. Do it by hand
-in the AWS Console first so you *see* each thing. Then, as a stretch goal, write it all as
-code (Terraform) in this folder so anyone can recreate it with one command. "Infrastructure
-as code" is a resume line on its own.
+The Terraform in `terraform/` creates everything the manager needs:
 
-## Before anything: protect your wallet
+- an S3 bucket for checkpoints and results (private, encrypted, 30-day expiry)
+- an SQS job queue and dead-letter queue
+- ECR repositories for the manager and job images
+- a least-privilege IAM role and instance profile for workers
+- a launch template (Amazon Linux 2023, IMDSv2 required) and an Auto Scaling
+  group that is 100% Spot, spread over six instance types with the
+  `price-capacity-optimized` strategy and Capacity Rebalancing enabled
+- an AWS Fault Injection Service template that sends a real two-minute Spot
+  interruption notice to one worker
 
-1. Make the account and choose the **Free plan**.
-2. Turn on MFA for the root user. Then make a normal IAM user for daily work and stop
-   using root.
-3. Create a **budget** with an email alert (e.g. $5). Do this first.
-4. Pick one region and use it everywhere (e.g. `us-east-1`).
-5. End every session by checking: no running EC2 instances you forgot about.
+The group starts at zero instances, so applying the Terraform costs almost
+nothing until you scale it up.
 
-## Phase 7: build the AWS pieces
+## Prerequisites
 
-| Step | What | Learn |
-|---|---|---|
-| 1 | Install the AWS CLI, run `aws configure` with your IAM user | Credentials, profiles, why keys never go in code |
-| 2 | Create an **S3 bucket** for checkpoints | Buckets, keys, private by default, block public access |
-| 3 | Create two **SQS queues**: `spot-runner-jobs` and `spot-runner-dead` | Visibility timeout, long polling, dead-letter queues |
-| 4 | Install the **AWS SDK for C++** on your Mac (only the `s3` and `sqs` parts, or it takes forever to build) | How C++ libraries get installed and found by CMake |
-| 5 | Add `AwsSettings` to `config.h` and write `config/manager.aws.json` | Keeping environments separate |
-| 6 | Write `s3_storage.cpp` and `sqs_queue.cpp`, build with `cmake --preset debug-aws` | The SDK pattern: request object, call, check outcome |
-| 7 | Run the manager **on your Mac** with `mode: aws`: it uses real S3 and SQS while still using Docker Desktop and the FileWatcher | Swapping one layer at a time |
+- An AWS account with a budget alert configured
+- AWS CLI v2, authenticated (`aws sts get-caller-identity` works)
+- Terraform 1.6 or newer
+- Docker with buildx
 
-## Phase 8: real spot computers
+## Steps
 
-| Step | What | Learn |
-|---|---|---|
-| 8 | Create an **ECR repository** and push your `prime-counter` image | Registries, image tags, `docker login` for ECR |
-| 9 | Create an **IAM role** for EC2 that can ONLY: read/write your bucket, use your two queues, pull from your ECR repo | Least privilege (big interview topic) |
-| 10 | Launch a small **spot instance** (Amazon Linux or Ubuntu) with that role. Install Docker on it and copy over your manager (or build it there) | EC2, spot pricing, SSH or Session Manager |
-| 11 | Handle ECR login on the instance so `ensure_image` can pull. Simplest: run the ECR `docker login` command on the instance; better: add `X-Registry-Auth` support in `docker_client.cpp` | How private registries authenticate |
-| 12 | Run the manager with `mode: aws` and the **ImdsWatcher** | Instance metadata, IMDSv2 tokens |
-| 13 | Use **AWS Fault Injection Service** to send a real spot interruption to your instance. Watch the job checkpoint, release, and resume on a second instance | Chaos testing, the proof that makes this project |
-| 14 | Optional: an **Auto Scaling group** of spot instances that starts the manager on boot (user data script), so a replacement appears by itself | Self-healing systems |
-| 15 | Extend `.github/workflows/ci.yml` to build the image and push to ECR on every merge to `main` (use GitHub's OIDC login to AWS, not stored keys) | CI/CD, keyless cloud auth |
+```bash
+cd infra/terraform
+terraform init
+terraform apply
 
-## What to measure for the README (and your resume bullet)
+REGION=us-east-1
+REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$REGION.amazonaws.com
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
 
-- Spot price vs. on-demand price for your instance type, so you can quote real dollars saved.
-- Interruptions survived out of interruptions sent (goal: all of them).
-- Time from interruption notice → checkpoint uploaded → job resumed elsewhere.
-- Work lost per interruption (should be at most one autosave interval).
-- Final answer identical with and without interruptions (correctness proof).
+# Build for x86_64 even from an Apple Silicon Mac.
+docker buildx build --platform linux/amd64 -t $REGISTRY/prime-counter:latest --push ../../jobs/prime-counter
+docker buildx build --platform linux/amd64 -t $(terraform output -raw manager_repository_url):latest --push ../..
+
+# Queue some work. The enqueue command needs a config pointing at the AWS queue;
+# fill config/aws.example.json from `terraform output` and build with the aws preset.
+spot-runner enqueue --config ../../config/aws.json ../../examples/jobs/*.json
+
+# Start two workers.
+aws autoscaling set-desired-capacity --auto-scaling-group-name $(terraform output -raw autoscaling_group) --desired-capacity 2
+
+# Send a real Spot interruption to one of them.
+aws fis start-experiment --experiment-template-id $(terraform output -raw fis_template_id)
+```
+
+Watch the event log on a worker through Session Manager
+(`/var/log/spot-runner/events.jsonl`). You should see `interruption_notice`,
+`job_stopping`, `checkpoint_uploaded`, and `job_released` on the interrupted
+instance, followed by `job_claimed` with `"resumed": true` on the other one.
+
+## Tearing down
+
+```bash
+aws autoscaling set-desired-capacity --auto-scaling-group-name $(terraform output -raw autoscaling_group) --desired-capacity 0
+terraform destroy
+```
+
+## Notes
+
+- **Image architecture.** The launch template uses x86_64 instance types. Images
+  built on an Apple Silicon Mac must be built with `--platform linux/amd64`.
+- **IMDS from a container.** The manager runs in a container with
+  `--network host`, and the launch template sets the IMDSv2 hop limit to 2, so
+  the manager can reach the metadata service for interruption notices and
+  credentials.
+- **Registry credentials.** The Docker Engine API ignores the CLI's stored
+  credentials, so user data pre-pulls images with the CLI. For images that are
+  not pre-pulled, set `docker.registry_auth_file` in the manager config to a
+  file containing the registry auth JSON.
+- **Status.** The Terraform is checked with `terraform validate` in CI. The AWS backends
+  compile and link against AWS SDK for C++ 1.11.909. The end-to-end Spot
+  interruption run above has not yet been performed against a live account.

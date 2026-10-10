@@ -1,0 +1,8 @@
+{
+  "job_id": "primes-200m",
+  "image": "prime-counter:latest",
+  "env": {
+    "TARGET": "200000000",
+    "AUTOSAVE_MS": "2000"
+  }
+}

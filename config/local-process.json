@@ -1,0 +1,20 @@
+{
+  "backend": "local",
+  "runtime": "process",
+  "manager_id": "local-2",
+  "work_dir": "./run/work/local-2",
+  "event_log": "./run/events/local-2.jsonl",
+  "max_attempts": 3,
+  "timing": {
+    "poll_interval_ms": 500,
+    "checkpoint_sync_interval_ms": 2000,
+    "lease_duration_s": 30,
+    "stop_grace_period_s": 30,
+    "idle_backoff_ms": 1000
+  },
+  "local": {
+    "storage_dir": "./run/storage",
+    "queue_dir": "./run/queue",
+    "interrupt_file": "./run/interrupt-local-2"
+  }
+}

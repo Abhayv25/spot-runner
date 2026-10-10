@@ -1,0 +1,9 @@
+build/
+run/
+.git/
+.github/
+docs/
+infra/
+scripts/
+tests/
+*.md

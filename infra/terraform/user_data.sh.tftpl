@@ -1,0 +1,50 @@
+#!/bin/bash
+# Worker bootstrap: install Docker, pull images from ECR, start the manager.
+set -euo pipefail
+
+dnf install -y docker
+systemctl enable --now docker
+
+# The Docker Engine API does not use the CLI's stored credentials, so images
+# are pulled here with the CLI; the manager then finds them locally.
+aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
+docker pull ${manager_image}
+%{ for image in job_images ~}
+docker pull ${image}
+%{ endfor ~}
+
+mkdir -p /etc/spot-runner /var/lib/spot-runner/work /var/log/spot-runner
+cat > /etc/spot-runner/config.json <<'EOF'
+{
+  "backend": "aws",
+  "runtime": "docker",
+  "manager_id": "auto",
+  "work_dir": "/var/lib/spot-runner/work",
+  "event_log": "/var/log/spot-runner/events.jsonl",
+  "max_attempts": 3,
+  "drain_on_rebalance": true,
+  "timing": {
+    "poll_interval_ms": 1000,
+    "checkpoint_sync_interval_ms": 15000,
+    "lease_duration_s": ${lease_duration_s},
+    "stop_grace_period_s": 60,
+    "idle_backoff_ms": 1000
+  },
+  "aws": {
+    "region": "${region}",
+    "bucket": "${bucket}",
+    "queue_url": "${queue_url}",
+    "dead_letter_queue_url": "${dead_letter_queue_url}",
+    "key_prefix": "spot-runner/"
+  }
+}
+EOF
+
+# --network host so the manager can reach IMDS; the work directory is mounted
+# at the same path because the Docker daemon resolves bind mounts on the host.
+docker run -d --name spot-runner-manager --restart on-failure --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /var/lib/spot-runner:/var/lib/spot-runner \
+  -v /var/log/spot-runner:/var/log/spot-runner \
+  -v /etc/spot-runner:/etc/spot-runner:ro \
+  ${manager_image} run --config /etc/spot-runner/config.json

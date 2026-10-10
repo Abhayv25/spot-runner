@@ -27,3 +27,10 @@ run/
 .env
 *.pem
 credentials
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
